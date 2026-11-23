@@ -56,6 +56,10 @@ type commandDeps struct {
 	// scan fetches and classifies one asset. It is injected so tests never
 	// touch the network.
 	scan func(context.Context, mechanics.Asset) (*mechanics.Report, error)
+	// scanner builds a production Scanner for the given SEP-0042 lists and
+	// cache policy. It is injected so a test can observe what a command wires
+	// without constructing a transport.
+	scanner func([]string, scan.Options) *scan.Scanner
 	// serve starts the HTTP API. It is injected so dispatch can be tested
 	// without binding a port.
 	serve func([]string, *slog.Logger) error
@@ -69,8 +73,21 @@ func defaultDeps() commandDeps {
 		scan: func(ctx context.Context, a mechanics.Asset) (*mechanics.Report, error) {
 			return scan.New().Scan(ctx, a)
 		},
-		serve: runServe,
+		scanner: newScanner,
+		serve:   runServe,
 	}
+}
+
+// flagSetOutput is where a command's flag list is printed. It is a variable so
+// a test can capture the flags a command registers without starting it.
+var flagSetOutput io.Writer = os.Stderr
+
+// newFlagSet is the one place a command's FlagSet is built, so every command
+// reports help to the same writer.
+func newFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(flagSetOutput)
+	return fs
 }
 
 func usage(w io.Writer) {
@@ -101,6 +118,9 @@ Commands that scan also accept:
   -cache-directory-ttl D   reuse a curated directory answer for D (0 disables)
   -cache-blocklist-ttl D   reuse a blocklist answer for D (0 disables)
   -no-cache                re-fetch curated sources on every scan
+
+Commands that consume SEP-0042 asset lists (scan, attestation, history, serve)
+also accept:
   -asset-lists URL[,URL...]
                            SEP-0042 Stellar Asset Lists to consume
                            (repeatable). No list is used by default.
@@ -176,8 +196,9 @@ func runWith(args []string, d commandDeps) error {
 }
 
 func runScan(args []string, d commandDeps) error {
-	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	fs := newFlagSet("scan")
 	assetLists := assetListFlags(fs)
+	cache := cacheFlags(fs)
 	recordDir := fs.String("record", "",
 		"save every upstream response into DIR for later -replay")
 	replayDir := fs.String("replay", "",
@@ -196,7 +217,7 @@ func runScan(args []string, d commandDeps) error {
 		return fmt.Errorf("-record and -replay are mutually exclusive")
 	}
 
-	scanFn, finish, err := scanFuncForRecording(assetLists(), d, *recordDir, *replayDir)
+	scanFn, finish, err := scanFuncForRecording(assetLists(), cache(), d, *recordDir, *replayDir)
 	if err != nil {
 		return err
 	}
@@ -228,11 +249,11 @@ func runScan(args []string, d commandDeps) error {
 // fetchers' transport in a recorder; -replay replaces it with the recording.
 // Nothing else about the scan changes — same fetches, same engine — which is
 // what makes a replayed report comparable to the recorded one.
-func scanFuncForRecording(lists []string, d commandDeps, recordDir, replayDir string) (func(context.Context, mechanics.Asset) (*mechanics.Report, error), func(), error) {
+func scanFuncForRecording(lists []string, opts scan.Options, d commandDeps, recordDir, replayDir string) (func(context.Context, mechanics.Asset) (*mechanics.Report, error), func(), error) {
 	if recordDir == "" && replayDir == "" {
-		return scanFuncFor(lists, d), func() {}, nil
+		return scanFuncFor(lists, opts, d), func() {}, nil
 	}
-	scanner := newScanner(lists)
+	scanner := d.scanner(lists, opts)
 
 	if recordDir != "" {
 		rec, err := replay.NewRecorder(recordDir, scanner.Horizon.HTTP.Transport)
@@ -274,11 +295,11 @@ func wireTransport(s *scan.Scanner, rt http.RoundTripper) {
 // SEP-0042 list is configured it returns the injected dependency, so dispatch
 // tests never touch the network; when lists are named it wires a production
 // scanner configured to consult them.
-func scanFuncFor(lists []string, d commandDeps) func(context.Context, mechanics.Asset) (*mechanics.Report, error) {
-	if len(lists) == 0 {
+func scanFuncFor(lists []string, opts scan.Options, d commandDeps) func(context.Context, mechanics.Asset) (*mechanics.Report, error) {
+	if len(lists) == 0 && opts == scan.DefaultOptions() {
 		return d.scan
 	}
-	return newScanner(lists).Scan
+	return d.scanner(lists, opts).Scan
 }
 
 // assetListFlags registers the -asset-lists flag shared by every command that
@@ -299,11 +320,31 @@ func assetListFlags(fs *flag.FlagSet) func() []string {
 }
 
 // newScanner returns a production Scanner configured to consult the given
-// SEP-0042 asset lists.
-func newScanner(lists []string) *scan.Scanner {
-	sc := scan.New()
+// SEP-0042 asset lists under the given reputation cache policy.
+func newScanner(lists []string, opts scan.Options) *scan.Scanner {
+	sc := scan.NewWithOptions(opts)
 	sc.AssetListURLs = lists
 	return sc
+}
+
+// cacheFlags registers the reputation-cache flags shared by every command that
+// scans, and returns the policy they describe. docs/caching.md tells an operator
+// to reach for these flags, so every command the document names has to register
+// them.
+func cacheFlags(fs *flag.FlagSet) func() scan.Options {
+	defaults := scan.DefaultOptions()
+	directoryTTL := fs.Duration("cache-directory-ttl", defaults.ReputationDirectoryTTL,
+		"reuse a curated directory answer for this long (0 disables)")
+	blocklistTTL := fs.Duration("cache-blocklist-ttl", defaults.ReputationBlocklistTTL,
+		"reuse a blocklist answer for this long (0 disables)")
+	noCache := fs.Bool("no-cache", false, "re-fetch curated sources on every scan")
+	return func() scan.Options {
+		return scan.Options{
+			ReputationDirectoryTTL: *directoryTTL,
+			ReputationBlocklistTTL: *blocklistTTL,
+			NoReputationCache:      *noCache,
+		}
+	}
 }
 
 // listFlag collects repeated -asset-lists values as well as comma-separated
@@ -338,8 +379,9 @@ func (l *listFlag) Set(v string) error {
 // or the full assay-evidence-vN line; an empty value keeps the default
 // (newest binding wins). A verifier compares like with like because of it.
 func runAttestation(args []string, d commandDeps) error {
-	fs := flag.NewFlagSet("attestation", flag.ContinueOnError)
+	fs := newFlagSet("attestation")
 	assetLists := assetListFlags(fs)
+	cache := cacheFlags(fs)
 	preimage := fs.Bool("preimage", false, "include the canonical bytes evidence_hash commits to")
 	raw := fs.Bool("raw", false, "print only the attest() arguments, tab-separated, for scripting")
 	preimageVersion := fs.String("preimage-version", "",
@@ -368,7 +410,7 @@ func runAttestation(args []string, d commandDeps) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	scanFn := scanFuncFor(assetLists(), d)
+	scanFn := scanFuncFor(assetLists(), cache(), d)
 	finish := func() {}
 	recordingDir := ""
 	if *bundleOut != "" {
@@ -380,7 +422,7 @@ func runAttestation(args []string, d commandDeps) error {
 		recordingDir = dir
 		// Record into a private directory first; the archive is written only
 		// after the report is derived, so a failed scan leaves no half bundle.
-		scanFn, finish, err = scanFuncForRecording(assetLists(), d, recordingDir, "")
+		scanFn, finish, err = scanFuncForRecording(assetLists(), cache(), d, recordingDir, "")
 		if err != nil {
 			return err
 		}
@@ -445,8 +487,9 @@ func runAttestation(args []string, d commandDeps) error {
 }
 
 func runHistory(args []string, d commandDeps) error {
-	fs := flag.NewFlagSet("history", flag.ContinueOnError)
+	fs := newFlagSet("history")
 	assetLists := assetListFlags(fs)
+	cache := cacheFlags(fs)
 	guarantee := fs.Bool("guarantee", false, "exit non-zero when there is no history")
 	raw := fs.Bool("raw", false, "print only the history, tab-separated, for scripting")
 	serverURL := fs.String("server", "", "fetch history from a running assay server (e.g. http://localhost:8080)")
@@ -475,7 +518,7 @@ func runHistory(args []string, d commandDeps) error {
 		}
 	} else {
 		// Compute history from local scan (existing behavior).
-		report, err := scanFuncFor(assetLists(), d)(ctx, asset)
+		report, err := scanFuncFor(assetLists(), cache(), d)(ctx, asset)
 		if err != nil {
 			return err
 		}
@@ -659,8 +702,9 @@ type historyEntry struct {
 }
 
 func runServe(args []string, log *slog.Logger) error {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs := newFlagSet("serve")
 	assetLists := assetListFlags(fs)
+	cache := cacheFlags(fs)
 	addr := fs.String("addr", ":8080", "listen address")
 	historyPath := fs.String("history", "",
 		"path to the observation history log (JSON Lines); empty keeps history in memory only")
@@ -685,7 +729,7 @@ func runServe(args []string, log *slog.Logger) error {
 		}
 		srv.TrustedProxies = proxies
 	}
-	srv.Scanner = newScanner(assetLists())
+	srv.Scanner = newScanner(assetLists(), cache())
 	var historyStore *historystore.Store
 	if *historyPath != "" {
 		store, err := historystore.Open(*historyPath)
