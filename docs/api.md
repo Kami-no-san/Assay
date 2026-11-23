@@ -26,6 +26,15 @@ carry these headers.
 Exposed response headers: `X-Request-Id`, `X-Assay-Undetermined`,
 `Retry-After`.
 
+## Request Identifiers
+
+Every response carries an `X-Request-Id` header, and the same value is stamped
+on each log line the request produces, so one identifier pulls a whole request
+out of the logs. A caller may supply its own `X-Request-Id` to correlate across
+services. The server accepts it only when it is **1–128 bytes of
+`[A-Za-z0-9._:-]`**; an empty, over-long, or out-of-charset value is ignored and
+a fresh identifier (16 random bytes, hex-encoded) is generated instead.
+
 ## Reverse Proxies and Rate Limiting
 
 In public deployments behind a reverse proxy (such as nginx, Caddy, or a cloud load balancer), `r.RemoteAddr` is the IP of the proxy peer. Without proxy awareness, all clients connecting through that proxy share a single rate-limiting bucket.
