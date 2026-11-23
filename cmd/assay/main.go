@@ -92,7 +92,7 @@ func usage(w io.Writer) {
   assay verify-preimage [-version VERSION] HASH PREIMAGE
                                   compare a stored hash with canonical preimage bytes
   assay checks                    print every check's ID and description
-  assay serve [-addr] [-history PATH] [-observe FILE] [-observe-interval DURATION]
+  assay serve [-addr] [-history PATH] [-history-retention N] [-observe FILE] [-observe-interval DURATION]
                                   serve the HTTP API and UI
   assay version                   print scanner identity, preimage encodings
                                   and build (VCS, Go) information
@@ -125,6 +125,7 @@ The history command additionally accepts:
                           computing from a local scan (e.g. http://localhost:8080)
 
 The serve command additionally accepts:
+  -history-retention N    observations kept per asset (default 256)
   -observe FILE           path to asset list file for scheduled observation
   -observe-interval DURATION
                           interval between scheduled scans (default 6h)
@@ -658,12 +659,24 @@ type historyEntry struct {
 	Time       time.Time `json:"time"`
 }
 
+// openHistory returns the store serve records into: in memory when no path is
+// configured, file-backed when one is, and in both cases bounded by retention
+// observations per asset.
+func openHistory(path string, retention int) (*historystore.Store, error) {
+	if path == "" {
+		return historystore.NewWithRetention(retention), nil
+	}
+	return historystore.OpenWithRetention(path, retention)
+}
+
 func runServe(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	assetLists := assetListFlags(fs)
 	addr := fs.String("addr", ":8080", "listen address")
 	historyPath := fs.String("history", "",
 		"path to the observation history log (JSON Lines); empty keeps history in memory only")
+	historyRetention := fs.Int("history-retention", historystore.DefaultRetention,
+		"observations retained per asset (minimum 1)")
 	observeFile := fs.String("observe", "",
 		"path to asset list file (one CODE-ISSUER per line) for scheduled observation")
 	observeInterval := fs.Duration("observe-interval", 6*time.Hour,
@@ -672,6 +685,9 @@ func runServe(args []string, log *slog.Logger) error {
 		"comma-separated CIDRs of trusted reverse proxies whose X-Forwarded-For headers are trusted")
 	if err := parseFlags(fs, args); err != nil {
 		return err
+	}
+	if *historyRetention < 1 {
+		return usagef("serve: -history-retention must be at least 1, got %d", *historyRetention)
 	}
 
 	// The server is where a list configuration matters most: every scan it
@@ -686,16 +702,12 @@ func runServe(args []string, log *slog.Logger) error {
 		srv.TrustedProxies = proxies
 	}
 	srv.Scanner = newScanner(assetLists())
-	var historyStore *historystore.Store
-	if *historyPath != "" {
-		store, err := historystore.Open(*historyPath)
-		if err != nil {
-			return fmt.Errorf("serve: history: %w", err)
-		}
-		srv.History = store
-		historyStore = store
-		defer func() { _ = historyStore.Close() }()
+	historyStore, err := openHistory(*historyPath, *historyRetention)
+	if err != nil {
+		return fmt.Errorf("serve: history: %w", err)
 	}
+	srv.History = historyStore
+	defer func() { _ = historyStore.Close() }()
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
