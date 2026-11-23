@@ -33,6 +33,9 @@ Commands that scan also accept:
   -cache-directory-ttl D   reuse a curated directory answer for D (0 disables)
   -cache-blocklist-ttl D   reuse a blocklist answer for D (0 disables)
   -no-cache                re-fetch curated sources on every scan
+
+Commands that consume SEP-0042 asset lists (scan, attestation, history, serve)
+also accept:
   -asset-lists URL[,URL...]
                            SEP-0042 Stellar Asset Lists to consume
                            (repeatable). No list is used by default.
@@ -64,7 +67,8 @@ The serve command additionally accepts:
                           trusted reverse proxy CIDRs for rate limiting
 ```
 
-Commands that scan also accept:
+Commands that consume SEP-0042 asset lists (`scan`, `attestation`, `history`,
+`serve`) also accept:
 
 - `-asset-lists URL[,URL...]` — SEP-0042 Stellar Asset Lists to consume, given
   as a comma-separated list or repeated. **No list is used by default**: nothing
