@@ -709,7 +709,11 @@ func openHistory(path string, retention int) (*historystore.Store, error) {
 	if path == "" {
 		return historystore.NewWithRetention(retention), nil
 	}
-	return historystore.OpenWithRetention(path, retention)
+	store, err := historystore.OpenWithRetention(path, retention)
+	if err != nil {
+		return nil, fmt.Errorf("serve: history: %w", err)
+	}
+	return store, nil
 }
 
 func runServe(args []string, log *slog.Logger) error {
@@ -746,15 +750,9 @@ func runServe(args []string, log *slog.Logger) error {
 		srv.TrustedProxies = proxies
 	}
 	srv.Scanner = newScanner(assetLists(), cache())
-	var historyStore *historystore.Store
-	if *historyPath != "" {
-		store, err := historystore.Open(*historyPath)
-		if err != nil {
-			return fmt.Errorf("serve: history: %w", err)
-		}
-		srv.History = store
-		historyStore = store
-		defer func() { _ = historyStore.Close() }()
+	historyStore, err := openHistory(*historyPath, *historyRetention)
+	if err != nil {
+		return err
 	}
 	srv.History = historyStore
 	defer func() { _ = historyStore.Close() }()
